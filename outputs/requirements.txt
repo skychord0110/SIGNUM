@@ -1,0 +1,11 @@
+streamlit>=1.32
+yfinance>=0.2.40
+pandas>=2.0
+numpy>=1.24
+plotly>=5.18
+requests>=2.28
+xlrd==1.2.0
+openpyxl>=3.1
+beautifulsoup4>=4.12
+lxml>=4.9
+html5lib>=1.1
