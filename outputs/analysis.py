@@ -1,12 +1,21 @@
 """
-SIGNUM ― 解析・スクリーニングモジュール (並列対応 + 自動スクレイピング)
+SIGNUM ― 解析・スクリーニングモジュール (並列対応 + 過去日バックテスト)
 """
 
 from __future__ import annotations
 
+import warnings
+try:
+    from bs4 import XMLParsedAsHTMLWarning
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+except Exception:
+    pass
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import io
 import json
 import math
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -34,6 +43,8 @@ USER_AGENT_HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 _cache_lock = threading.Lock()
 
@@ -162,9 +173,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ----------------------------------------------------------------------
-# 黒字転換
-# ----------------------------------------------------------------------
 ORDINARY_INCOME_LABELS = (
     "Pretax Income", "Income Before Tax", "Pretax Profit",
     "Ordinary Income", "Operating Income", "Net Income",
@@ -192,7 +200,7 @@ def quarterly_turnaround(code: str | int,
 
 
 # ----------------------------------------------------------------------
-# 永続キャッシュ (24時間)
+# キャッシュ
 # ----------------------------------------------------------------------
 def _cache_load() -> dict:
     if not SCRAPE_CACHE_PATH.exists():
@@ -234,164 +242,254 @@ def _cache_set(key: str, data: dict) -> None:
         _cache_save(cache)
 
 
-# ----------------------------------------------------------------------
-# 株探スクレイピング: ストックオプション関連 IR
-# ----------------------------------------------------------------------
-def _scrape_options_kabutan(code: str, within_days: int = 365) -> dict:
-    """株探の適時開示から SO 関連IRを取得 (キャッシュなしの実体)"""
-    if requests is None:
-        return {"found": False, "info": "", "error": "requests未インストール"}
-    code = str(code).zfill(4)
-    cutoff = pd.Timestamp.now() - pd.Timedelta(days=within_days)
-    keywords = ["ストックオプション", "新株予約権"]
-    best_date = None
-    best_title = ""
-
-    for keyword in keywords:
-        try:
-            r = requests.get(
-                "https://kabutan.jp/disclosures/",
-                params={"code": code, "keyword": keyword},
-                headers=USER_AGENT_HEADERS,
-                timeout=15,
-            )
-            if r.status_code != 200:
-                continue
-            r.encoding = r.apparent_encoding or "utf-8"
-            tables = pd.read_html(io.StringIO(r.text))
-        except Exception:
-            continue
-
-        for t in tables:
-            if len(t) == 0 or len(t.columns) < 2:
-                continue
-            for _, row in t.iterrows():
-                # 行から日付と見出しを抽出
-                vals = [str(v) for v in row.values if pd.notna(v)]
-                joined = " ".join(vals)
-                if not any(kw in joined for kw in keywords):
-                    continue
-                date = None
-                for v in vals:
-                    try:
-                        d = pd.to_datetime(v, errors="coerce")
-                        if pd.notna(d) and pd.Timestamp("2015-01-01") < d <= pd.Timestamp.now():
-                            date = d
-                            break
-                    except Exception:
-                        continue
-                if date is None or date < cutoff:
-                    continue
-                title = max(vals, key=len)
-                if best_date is None or date > best_date:
-                    best_date = date
-                    best_title = title[:200]
-
-    if best_date is not None:
-        return {
-            "found": True,
-            "info": f"{best_date.strftime('%Y-%m-%d')}: {best_title[:100]}",
-        }
-    return {"found": False, "info": ""}
-
-
-def has_recent_paid_so(code: str, within_days: int = 365,
-                       paid_so_df=None) -> tuple[bool, str]:
-    """旧API互換: 自動スクレイピング結果を返す。 paid_so_df は無視。"""
-    cached = _cache_get(f"options:{code}:{within_days}")
-    if cached is not None:
-        return cached.get("found", False), cached.get("info", "")
-    res = _scrape_options_kabutan(code, within_days)
-    _cache_set(f"options:{code}:{within_days}", res)
-    return res.get("found", False), res.get("info", "")
-
-
-# ----------------------------------------------------------------------
-# 株探スクレイピング: 空売り残高 → 連続買戻し検出
-# ----------------------------------------------------------------------
-def _scrape_short_cover_kabutan(code: str) -> dict:
-    """株探の空売りページから直近残高が連続減少しているか判定"""
-    if requests is None:
-        return {"found": False, "info": "", "error": "requests未インストール"}
-    code = str(code).zfill(4)
-    try:
-        r = requests.get(
-            "https://kabutan.jp/stock/karauri",
-            params={"code": code},
-            headers=USER_AGENT_HEADERS,
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return {"found": False, "info": ""}
-        r.encoding = r.apparent_encoding or "utf-8"
-        tables = pd.read_html(io.StringIO(r.text))
-    except Exception:
-        return {"found": False, "info": ""}
-
-    for t in tables:
-        col_str = " ".join(str(c) for c in t.columns)
-        if not ("残高" in col_str or "株数" in col_str or "比率" in col_str):
-            continue
-        if len(t) < 3:
-            continue
-        # 数値が3つ以上ある列を探す
-        numeric_col = None
-        for c in t.columns:
-            try:
-                vals = pd.to_numeric(
-                    t[c].astype(str).str.replace(",", "").str.replace("%", "").str.strip(),
-                    errors="coerce",
-                )
-                if vals.notna().sum() >= 3:
-                    numeric_col = c
-                    break
-            except Exception:
-                continue
-        if numeric_col is None:
-            continue
-        try:
-            vals = pd.to_numeric(
-                t[numeric_col].astype(str).str.replace(",", "").str.replace("%", "").str.strip(),
-                errors="coerce",
-            ).dropna()
-        except Exception:
-            continue
-        if len(vals) < 3:
-            continue
-        recent = vals.head(5).tolist()  # 直近5件 (新しい順を想定)
-        # 直近3件すべて減少していれば「連続買戻し」
-        if len(recent) >= 3 and recent[0] < recent[1] < recent[2]:
-            pct = (recent[0] - recent[2]) / max(abs(recent[2]), 1e-9) * 100
-            return {
-                "found": True,
-                "info": f"連続3回減少 {recent[2]:,.1f} → {recent[0]:,.1f} ({pct:+.1f}%)",
-            }
-        if len(recent) >= 2 and recent[0] < recent[1]:
-            return {
-                "found": True,
-                "info": f"直近2回減少 {recent[1]:,.1f} → {recent[0]:,.1f}",
-            }
-    return {"found": False, "info": ""}
-
-
-def has_recent_short_cover(code: str, within_days: int = 60,
-                           sc_df=None) -> tuple[bool, str]:
-    """旧API互換: 自動スクレイピング結果を返す。 sc_df は無視。"""
-    cached = _cache_get(f"short:{code}")
-    if cached is not None:
-        return cached.get("found", False), cached.get("info", "")
-    res = _scrape_short_cover_kabutan(code)
-    _cache_set(f"short:{code}", res)
-    return res.get("found", False), res.get("info", "")
-
-
 def clear_scrape_cache() -> None:
-    """スクレイピングキャッシュをクリア"""
     if SCRAPE_CACHE_PATH.exists():
         try:
             SCRAPE_CACHE_PATH.unlink()
         except Exception:
             pass
+
+
+# ----------------------------------------------------------------------
+# パースヘルパー (karauri.net 用)
+# ----------------------------------------------------------------------
+def _coerce_number(v) -> Optional[float]:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    s = str(v).strip()
+    if not s or s in ("-", "ー", "‐", "—"):
+        return None
+    s = s.replace(",", "").replace("%", "").replace("＋", "+").replace("−", "-")
+    s = re.sub(r"[^0-9.+\-eE]", "", s)
+    if not s or s in (".", "-", "+"):
+        return None
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _coerce_date(v) -> Optional[pd.Timestamp]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    s2 = re.sub(r"年|月", "-", s).replace("日", "").strip("-")
+    for cand in (s2, s):
+        try:
+            d = pd.to_datetime(cand, errors="coerce")
+            if pd.notna(d) and pd.Timestamp("2015-01-01") < d <= pd.Timestamp.now() + pd.Timedelta(days=7):
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def _is_date_string(v) -> bool:
+    return _coerce_date(v) is not None
+
+
+def _is_pure_number(v) -> bool:
+    s = str(v).strip()
+    if not s:
+        return False
+    return bool(re.fullmatch(r"[+\-±]?\d[\d,.]*\s*%?", s))
+
+
+def _normalize_institution_name(name: str) -> str:
+    if not name:
+        return ""
+    s = re.sub(r"\s+", " ", str(name).strip())
+    s = re.sub(r"[（）\(\)（）]", "", s)
+    s = re.sub(
+        r"(株式会社|有限会社|合同会社|Co\.,?\s*Ltd\.?|Ltd\.?|LLC|L\.L\.C\.|"
+        r"S\.A\.?|Inc\.?|Corp\.?|Limited|Holdings|Group|Securities|証券)",
+        "", s, flags=re.IGNORECASE,
+    )
+    return re.sub(r"\W+", "", s.lower())[:40]
+
+
+def _fetch_karauri_html(code: str) -> str:
+    if requests is None:
+        return ""
+    code = str(code).zfill(4)
+    for url in (f"https://karauri.net/{code}/", f"https://karauri.net/{code}"):
+        try:
+            r = requests.get(url, headers=USER_AGENT_HEADERS, timeout=20)
+            if r.status_code == 200 and r.text:
+                r.encoding = r.apparent_encoding or "utf-8"
+                return r.text
+        except Exception:
+            continue
+    return ""
+
+
+def _parse_karauri_records(html: str) -> list[dict]:
+    if not html:
+        return []
+    records: list[dict] = []
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except Exception:
+        tables = []
+
+    for t_idx, table in enumerate(tables):
+        if table is None or len(table) == 0 or len(table.columns) < 2:
+            continue
+        col_role: dict = {}
+        for c in table.columns:
+            cs = str(c)
+            if any(k in cs for k in ("報告日", "計算日", "計算年月日", "日付")):
+                col_role[c] = "date"
+            elif any(k in cs for k in ("商号", "機関", "名称", "投資家", "報告者")):
+                col_role[c] = "name"
+            elif "比率" in cs:
+                col_role[c] = "ratio"
+            elif any(k in cs for k in ("数量", "株数")):
+                col_role[c] = "qty"
+            elif "変化" in cs or "増減" in cs or "前回" in cs:
+                col_role[c] = "change"
+
+        for _, row in table.iterrows():
+            vals = list(row.values)
+            cells = [str(v).strip() for v in vals if pd.notna(v) and str(v).strip()]
+            if len(cells) < 2:
+                continue
+            rec_date = None
+            rec_name = None
+            rec_ratio = None
+            rec_change = None
+            if col_role:
+                for col, role in col_role.items():
+                    if col not in table.columns:
+                        continue
+                    val = row[col] if col in row.index else None
+                    if val is None or (isinstance(val, float) and math.isnan(val)):
+                        continue
+                    if role == "date" and rec_date is None:
+                        rec_date = _coerce_date(val)
+                    elif role == "name" and rec_name is None:
+                        s = str(val).strip()
+                        if s and not _is_pure_number(s) and not _is_date_string(s):
+                            rec_name = s
+                    elif role == "ratio" and rec_ratio is None:
+                        n = _coerce_number(val)
+                        if n is not None and 0 < n < 50:
+                            rec_ratio = n
+                    elif role == "change" and rec_change is None:
+                        n = _coerce_number(val)
+                        if n is not None and abs(n) < 50:
+                            rec_change = n
+            if rec_date is None:
+                for v in cells:
+                    d = _coerce_date(v)
+                    if d:
+                        rec_date = d
+                        break
+            if rec_name is None:
+                cands = [s for s in cells
+                         if not _is_pure_number(s)
+                         and not _is_date_string(s)
+                         and len(s) >= 3]
+                if cands:
+                    rec_name = max(cands, key=len).strip()
+            if rec_ratio is None:
+                for v in cells:
+                    n = _coerce_number(v)
+                    if n is not None and 0 < n < 50:
+                        rec_ratio = n
+                        break
+            if rec_name and rec_date and rec_ratio is not None:
+                records.append({
+                    "name": rec_name[:80],
+                    "date": rec_date,
+                    "ratio": float(rec_ratio),
+                    "change": rec_change if rec_change is not None else None,
+                    "table_idx": t_idx,
+                })
+    return records
+
+
+def analyse_karauri(code: str) -> dict:
+    code = str(code).zfill(4)
+    html = _fetch_karauri_html(code)
+    records = _parse_karauri_records(html)
+    if not records:
+        return {"found": False, "info": "", "count": 0,
+                "records_total": 0, "institutions": [], "covering": []}
+    by_inst: dict[str, list[dict]] = {}
+    display_name: dict[str, str] = {}
+    for rec in records:
+        key = _normalize_institution_name(rec["name"])
+        if not key:
+            continue
+        by_inst.setdefault(key, []).append(rec)
+        if key not in display_name or len(rec["name"]) > len(display_name[key]):
+            display_name[key] = rec["name"]
+    covering = []
+    for key, recs in by_inst.items():
+        recs = sorted(recs, key=lambda x: x["date"], reverse=True)
+        latest = recs[0]
+        prev = recs[1] if len(recs) > 1 else None
+        is_covering = False
+        delta = 0.0
+        if prev is not None and latest["ratio"] < prev["ratio"]:
+            is_covering = True
+            delta = latest["ratio"] - prev["ratio"]
+        elif latest.get("change") is not None and latest["change"] < 0:
+            is_covering = True
+            delta = float(latest["change"])
+        if is_covering:
+            covering.append({
+                "name": display_name[key],
+                "latest_date": latest["date"].strftime("%Y-%m-%d"),
+                "latest_ratio": latest["ratio"],
+                "prev_ratio": prev["ratio"] if prev else None,
+                "delta": delta,
+            })
+    covering.sort(key=lambda x: x["delta"])
+    count = len(covering)
+    if count == 0:
+        return {"found": False, "info": "", "count": 0,
+                "records_total": len(records),
+                "institutions": list(display_name.values()), "covering": []}
+    names = ", ".join(c["name"][:30] for c in covering[:3])
+    info = f"{count} institutions covering ({names})"
+    return {"found": True, "info": info, "count": count,
+            "records_total": len(records),
+            "institutions": list(display_name.values()), "covering": covering}
+
+
+def has_recent_short_cover(code: str, within_days: int = 60, sc_df=None) -> tuple[bool, str]:
+    code = str(code).zfill(4)
+    cached = _cache_get(f"karauri:{code}")
+    if cached is not None:
+        return cached.get("found", False), cached.get("info", "")
+    res = analyse_karauri(code)
+    _cache_set(f"karauri:{code}", res)
+    return res.get("found", False), res.get("info", "")
+
+
+def short_cover_count(code: str) -> int:
+    code = str(code).zfill(4)
+    cached = _cache_get(f"karauri:{code}")
+    if cached is not None:
+        return int(cached.get("count", 0))
+    res = analyse_karauri(code)
+    _cache_set(f"karauri:{code}", res)
+    return int(res.get("count", 0))
+
+
+def debug_karauri(code: str) -> dict:
+    code = str(code).zfill(4)
+    res = analyse_karauri(code)
+    _cache_set(f"karauri:{code}", res)
+    return res
+
+
+def has_recent_paid_so(code: str, within_days: int = 365, paid_so_df=None) -> tuple[bool, str]:
+    return False, ""
 
 
 # ----------------------------------------------------------------------
@@ -424,6 +522,7 @@ class StockMetrics:
     q_turnaround_info: str = ""
     short_cover_recent: bool = False
     short_cover_info: str = ""
+    short_cover_count: int = 0
     error: str = ""
 
 
@@ -470,9 +569,7 @@ def evaluate_stock(code: str | int, name: str = "", sector: str = "",
                    short_cover_window_days: int = 60,
                    check_turnaround: bool = False,
                    fetch_signals: bool = True,
-                   # 旧API互換
-                   paid_so_df=None,
-                   short_cover_df=None) -> StockMetrics:
+                   paid_so_df=None, short_cover_df=None) -> StockMetrics:
     df = fetch_history(code, period=period)
     m = metrics_from_history(df, str(code), name, sector, theme, market)
     if m.error:
@@ -485,12 +582,13 @@ def evaluate_stock(code: str | int, name: str = "", sector: str = "",
     if shares:
         m.shares_outstanding = float(shares)
     if fetch_signals:
-        paid_recent, paid_info = has_recent_paid_so(str(code).zfill(4), paid_so_window_days)
-        m.paid_so_recent = paid_recent
-        m.paid_so_info = paid_info
-        sc_recent, sc_info = has_recent_short_cover(str(code).zfill(4), short_cover_window_days)
-        m.short_cover_recent = sc_recent
-        m.short_cover_info = sc_info
+        try:
+            sr, si = has_recent_short_cover(str(code).zfill(4))
+            m.short_cover_recent = sr
+            m.short_cover_info = si
+            m.short_cover_count = short_cover_count(str(code).zfill(4))
+        except Exception:
+            pass
     if check_turnaround:
         is_turn, turn_info = quarterly_turnaround(code)
         m.q_turnaround = is_turn
@@ -519,8 +617,9 @@ def compute_rr_score(m: StockMetrics) -> float:
         score += 8
     if m.q_turnaround:
         score += 10
-    if m.short_cover_recent:
-        score += 10
+    if m.short_cover_recent and m.short_cover_count > 0:
+        bonus = 6 + min(m.short_cover_count - 1, 3) * 4
+        score += bonus
     return max(0.0, min(100.0, round(score, 2)))
 
 
@@ -549,16 +648,56 @@ def backtest_forward_return(df: pd.DataFrame, drawdown_threshold: float = -0.5,
     if not forwards:
         return {"samples": 0}
     arr = np.array(forwards)
-    return {
-        "samples": len(arr),
-        "mean": float(arr.mean()),
-        "median": float(np.median(arr)),
-        "win_rate": float((arr > 0).mean()),
-        "p20": float(np.percentile(arr, 20)),
-        "p80": float(np.percentile(arr, 80)),
-    }
+    return {"samples": len(arr), "mean": float(arr.mean()),
+            "median": float(np.median(arr)),
+            "win_rate": float((arr > 0).mean()),
+            "p20": float(np.percentile(arr, 20)),
+            "p80": float(np.percentile(arr, 80))}
 
 
+# ----------------------------------------------------------------------
+# Forward Returns (新規)
+# ----------------------------------------------------------------------
+def forward_returns(df: pd.DataFrame, as_of_date,
+                    horizons_bdays: tuple[int, ...] = (5, 21, 63, 126, 252)) -> dict[int, float]:
+    """
+    指定された as_of_date 以降の N営業日のフォワードリターンを計算。
+    返り値: {5: 0.012, 21: 0.045, ...} 形式
+    """
+    out: dict[int, float] = {h: float("nan") for h in horizons_bdays}
+    if df is None or df.empty:
+        return out
+    df = df.sort_index()
+    as_of_date = pd.Timestamp(as_of_date)
+    mask = df.index <= as_of_date
+    if not mask.any():
+        return out
+    base_idx = df.index[mask][-1]
+    try:
+        base_pos = df.index.get_loc(base_idx)
+        if isinstance(base_pos, slice):
+            base_pos = base_pos.start
+    except Exception:
+        return out
+    base_close = float(df.loc[base_idx, "Close"])
+    if base_close <= 0:
+        return out
+    for h in horizons_bdays:
+        target_pos = base_pos + h
+        if target_pos >= len(df):
+            out[h] = float("nan")
+            continue
+        try:
+            target_close = float(df["Close"].iloc[target_pos])
+            out[h] = (target_close / base_close) - 1
+        except Exception:
+            out[h] = float("nan")
+    return out
+
+
+# ----------------------------------------------------------------------
+# Screener config
+# ----------------------------------------------------------------------
 @dataclass
 class ScreenConfig:
     drawdown_min: float = -0.95
@@ -628,8 +767,7 @@ def screen_universe_parallel(
     max_workers: int = 10,
     period: str = "2y",
     progress_callback: Optional[Callable[[float, str], None]] = None,
-    paid_so_df=None,  # 旧API互換 (未使用)
-    short_cover_df=None,
+    paid_so_df=None, short_cover_df=None,
 ) -> list[StockMetrics]:
     rows = universe.to_dict("records")
     total = len(rows)
@@ -643,7 +781,6 @@ def screen_universe_parallel(
             except Exception:
                 pass
 
-    # Stage 1: バッチ履歴取得
     history_map: dict[str, pd.DataFrame] = {}
     fetched = 0
     for i in range(0, total, batch_size):
@@ -655,10 +792,8 @@ def screen_universe_parallel(
         except Exception:
             pass
         fetched += len(codes)
-        _progress(0.05 + 0.4 * fetched / total,
-                  f"履歴取得 {fetched}/{total}")
+        _progress(0.05 + 0.4 * fetched / total, f"Price history {fetched}/{total}")
 
-    # Stage 2: 履歴ベースの粗フィルタ
     survivors: list[StockMetrics] = []
     for r in rows:
         code = str(r["code"]).zfill(4)
@@ -674,11 +809,10 @@ def screen_universe_parallel(
             survivors.append(m)
 
     if not survivors:
-        _progress(1.0, "詳細解析対象なし")
+        _progress(1.0, "No survivors after history filter")
         return []
-    _progress(0.45, f"履歴フィルタ通過 {len(survivors)} 銘柄を詳細解析へ")
+    _progress(0.45, f"Survivors: {len(survivors)} — running enrichment")
 
-    # Stage 3: 並列 info + スクレイピング + turnaround
     needs_turnaround = config.require_turnaround
     needs_signals = config.fetch_signals or config.require_paid_so or config.require_short_cover
 
@@ -695,22 +829,14 @@ def screen_universe_parallel(
             pass
         if not _passes_market_cap_filter(m, config):
             return None
-        # 自動スクレイピング (キャッシュ付き)
         if needs_signals:
             try:
-                pr, pi = has_recent_paid_so(m.code, config.paid_so_window_days)
-                m.paid_so_recent = pr
-                m.paid_so_info = pi
-            except Exception:
-                pass
-            try:
-                sr, si = has_recent_short_cover(m.code, config.short_cover_window_days)
+                sr, si = has_recent_short_cover(m.code)
                 m.short_cover_recent = sr
                 m.short_cover_info = si
+                m.short_cover_count = short_cover_count(m.code)
             except Exception:
                 pass
-            if config.require_paid_so and not m.paid_so_recent:
-                return None
             if config.require_short_cover and not m.short_cover_recent:
                 return None
         if needs_turnaround:
@@ -740,12 +866,131 @@ def screen_universe_parallel(
                 pass
             if done % max(1, n_surv // 50) == 0 or done == n_surv:
                 _progress(0.45 + 0.55 * done / n_surv,
-                          f"詳細解析 {done}/{n_surv} (ヒット {len(final)})")
-    _progress(1.0, f"完了: ヒット {len(final)} 銘柄")
+                          f"Enrichment {done}/{n_surv} (matches {len(final)})")
+    _progress(1.0, f"Done: {len(final)} matches")
     final.sort(key=lambda x: x.rr_score, reverse=True)
     return final
 
 
+# ----------------------------------------------------------------------
+# 過去日バックテスト (新規)
+# ----------------------------------------------------------------------
+DEFAULT_HORIZONS_BDAYS = (5, 21, 63, 126, 252)  # 1W, 1M, 3M, 6M, 1Y
+
+
+def screen_universe_as_of_parallel(
+    universe: pd.DataFrame,
+    config: ScreenConfig,
+    as_of_date,
+    *,
+    horizons_bdays: tuple[int, ...] = DEFAULT_HORIZONS_BDAYS,
+    batch_size: int = 80,
+    max_workers: int = 10,
+    period: str = "5y",
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> list[dict]:
+    """
+    過去日 (as_of_date) 時点でスクリーニングを実行し、
+    抽出された各銘柄について N営業日後のフォワードリターンを計算して返す。
+    返り値: list of dict (StockMetricsのフィールド + fwd_5d/21d/63d/126d/252d)
+    """
+    as_of_date = pd.Timestamp(as_of_date)
+    rows = universe.to_dict("records")
+    total = len(rows)
+    if total == 0:
+        return []
+
+    def _progress(p: float, msg: str):
+        if progress_callback:
+            try:
+                progress_callback(min(max(p, 0.0), 1.0), msg)
+            except Exception:
+                pass
+
+    # Stage 1: バッチ履歴取得 (フォワード用に長めに取得)
+    history_map: dict[str, pd.DataFrame] = {}
+    fetched = 0
+    for i in range(0, total, batch_size):
+        batch_rows = rows[i:i + batch_size]
+        codes = [str(r["code"]).zfill(4) for r in batch_rows]
+        try:
+            hmap = fetch_history_batch(codes, period=period)
+            history_map.update(hmap)
+        except Exception:
+            pass
+        fetched += len(codes)
+        _progress(0.05 + 0.4 * fetched / total, f"Price history {fetched}/{total}")
+
+    # Stage 2: as-of でフィルタ (履歴を切り詰めて metrics 計算)
+    survivors: list[tuple[StockMetrics, pd.DataFrame]] = []
+    for r in rows:
+        code = str(r["code"]).zfill(4)
+        df_full = history_map.get(code)
+        if df_full is None or df_full.empty:
+            continue
+        df_past = df_full[df_full.index <= as_of_date]
+        if df_past.empty or len(df_past) < 60:  # 最低60営業日の履歴必要
+            continue
+        m = metrics_from_history(
+            df_past, code,
+            name=r.get("name", ""), sector=r.get("sector", ""),
+            theme=r.get("theme", ""), market=r.get("market", ""),
+        )
+        if _passes_history_filters(m, config):
+            survivors.append((m, df_full))
+
+    if not survivors:
+        _progress(1.0, "No survivors as of date")
+        return []
+    _progress(0.45, f"Survivors: {len(survivors)} — computing forward returns")
+
+    # Stage 3: 並列で info 取得 (時価総額近似) + フォワードリターン計算
+    def _enrich(item) -> Optional[dict]:
+        m, df_full = item
+        try:
+            info = fetch_info(m.code)
+            shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+            if shares:
+                m.shares_outstanding = float(shares)
+                # 時価総額の近似 (as_of の終値 × 現在の発行済株式数)
+                m.market_cap_oku = (m.last_close * float(shares)) / 1e8
+        except Exception:
+            pass
+        if not _passes_market_cap_filter(m, config):
+            return None
+        # フォワードリターン
+        fwd = forward_returns(df_full, as_of_date, horizons_bdays)
+        m.rr_score = compute_rr_score(m)
+        d = m.__dict__.copy()
+        d["forward_returns"] = fwd
+        for h in horizons_bdays:
+            d[f"fwd_{h}d"] = fwd.get(h, float("nan"))
+        return d
+
+    final: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_enrich, item): item for item in survivors}
+        done = 0
+        n_surv = len(survivors)
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                res = fut.result()
+                if res is not None:
+                    final.append(res)
+            except Exception:
+                pass
+            if done % max(1, n_surv // 50) == 0 or done == n_surv:
+                _progress(0.45 + 0.55 * done / n_surv,
+                          f"Forward returns {done}/{n_surv} (matches {len(final)})")
+    _progress(1.0, f"Done: {len(final)} matches")
+    final.sort(key=lambda x: x.get("rr_score", 0), reverse=True)
+    return final
+
+
+# ----------------------------------------------------------------------
+# 外部リンク
+# ----------------------------------------------------------------------
 def external_links(code: str | int, name: str = "") -> list[tuple[str, str]]:
     code = str(code)
     return [
@@ -755,11 +1000,7 @@ def external_links(code: str | int, name: str = "") -> list[tuple[str, str]]:
         ("みんかぶ", f"https://minkabu.jp/stock/{code}"),
         ("株探 ニュース", f"https://kabutan.jp/stock/news?code={code}"),
         ("株探 業績", f"https://kabutan.jp/stock/finance?code={code}"),
-        ("株探 空売り推移", f"https://kabutan.jp/stock/karauri?code={code}"),
-        ("ストックオプション検索 (株探)",
-         f"https://kabutan.jp/disclosures/?code={code}&keyword=%E3%82%B9%E3%83%88%E3%83%83%E3%82%AF%E3%82%AA%E3%83%97%E3%82%B7%E3%83%A7%E3%83%B3"),
-        ("新株予約権検索 (株探)",
-         f"https://kabutan.jp/disclosures/?code={code}&keyword=%E6%96%B0%E6%A0%AA%E4%BA%88%E7%B4%84%E6%A8%A9"),
+        ("karauri.net 機関別空売り", f"https://karauri.net/{code}/"),
         ("TDnet 適時開示 (検索)", "https://www.release.tdnet.info/inbs/I_main_00.html"),
         ("EDINET 有報検索", "https://disclosure2.edinet-fsa.go.jp/WEEK0010.aspx"),
         ("バフェットコード", f"https://www.buffett-code.com/company/{code}"),
@@ -768,7 +1009,6 @@ def external_links(code: str | int, name: str = "") -> list[tuple[str, str]]:
     ]
 
 
-# 旧 API のスタブ (互換性のため残す)
 def load_paid_so() -> pd.DataFrame:
     return pd.DataFrame(columns=["code", "ir_date", "description"])
 
