@@ -326,92 +326,95 @@ def _fetch_karauri_html(code: str) -> str:
 
 
 def _parse_karauri_records(html: str) -> list[dict]:
+    """karauri.net の銘柄ページから機関別空売り残高の報告履歴を抽出する。
+
+    対象テーブル: 計算日 / 空売り機関 / 残高割合 / 増減(割合) / 残高数量 / 増減(数量) / 備考
+    1行 = 1機関の1報告。増減(割合) は前回報告比のポイント差。
+    """
     if not html:
         return []
     records: list[dict] = []
     try:
         tables = pd.read_html(io.StringIO(html))
     except Exception:
-        tables = []
+        return []
 
     for t_idx, table in enumerate(tables):
-        if table is None or len(table) == 0 or len(table.columns) < 2:
+        if table is None or len(table) == 0 or len(table.columns) < 3:
             continue
-        col_role: dict = {}
+        cols = [str(c) for c in table.columns]
+        has_date = any(k in c for c in cols for k in ("計算", "報告日", "日付"))
+        has_name = any(k in c for c in cols for k in ("空売り者", "機関", "商号", "投資家", "報告者"))
+        has_ratio = any(k in c for c in cols for k in ("割合", "比率"))
+        if not (has_date and has_name and has_ratio):
+            continue
+        date_col = name_col = ratio_col = change_col = None
         for c in table.columns:
             cs = str(c)
-            if any(k in cs for k in ("報告日", "計算日", "計算年月日", "日付")):
-                col_role[c] = "date"
-            elif any(k in cs for k in ("商号", "機関", "名称", "投資家", "報告者")):
-                col_role[c] = "name"
-            elif "比率" in cs:
-                col_role[c] = "ratio"
-            elif any(k in cs for k in ("数量", "株数")):
-                col_role[c] = "qty"
-            elif "変化" in cs or "増減" in cs or "前回" in cs:
-                col_role[c] = "change"
+            if date_col is None and any(k in cs for k in ("計算", "報告日", "日付")):
+                date_col = c
+            elif name_col is None and any(k in cs for k in ("空売り者", "機関", "商号", "投資家", "報告者")):
+                name_col = c
+            elif ratio_col is None and any(k in cs for k in ("割合", "比率")):
+                ratio_col = c
+            elif (change_col is None and ratio_col is not None
+                  and any(k in cs for k in ("増減", "変化", "前回比"))):
+                # 残高割合の直後の増減列のみ採用 (残高数量の増減は対象外)
+                change_col = c
+        if date_col is None or name_col is None or ratio_col is None:
+            continue
 
         for _, row in table.iterrows():
-            vals = list(row.values)
-            cells = [str(v).strip() for v in vals if pd.notna(v) and str(v).strip()]
-            if len(cells) < 2:
+            rec_date = _coerce_date(row.get(date_col))
+            raw_name = row.get(name_col)
+            rec_name = "" if raw_name is None or (isinstance(raw_name, float) and math.isnan(raw_name)) \
+                else str(raw_name).strip()
+            if (rec_date is None or not rec_name
+                    or _is_pure_number(rec_name) or _is_date_string(rec_name)
+                    or "株" in rec_name and _is_pure_number(rec_name.replace("株", ""))):
                 continue
-            rec_date = None
-            rec_name = None
-            rec_ratio = None
-            rec_change = None
-            if col_role:
-                for col, role in col_role.items():
-                    if col not in table.columns:
-                        continue
-                    val = row[col] if col in row.index else None
-                    if val is None or (isinstance(val, float) and math.isnan(val)):
-                        continue
-                    if role == "date" and rec_date is None:
-                        rec_date = _coerce_date(val)
-                    elif role == "name" and rec_name is None:
-                        s = str(val).strip()
-                        if s and not _is_pure_number(s) and not _is_date_string(s):
-                            rec_name = s
-                    elif role == "ratio" and rec_ratio is None:
-                        n = _coerce_number(val)
-                        if n is not None and 0 < n < 50:
-                            rec_ratio = n
-                    elif role == "change" and rec_change is None:
-                        n = _coerce_number(val)
-                        if n is not None and abs(n) < 50:
-                            rec_change = n
-            if rec_date is None:
-                for v in cells:
-                    d = _coerce_date(v)
-                    if d:
-                        rec_date = d
-                        break
-            if rec_name is None:
-                cands = [s for s in cells
-                         if not _is_pure_number(s)
-                         and not _is_date_string(s)
-                         and len(s) >= 3]
-                if cands:
-                    rec_name = max(cands, key=len).strip()
-            if rec_ratio is None:
-                for v in cells:
-                    n = _coerce_number(v)
-                    if n is not None and 0 < n < 50:
-                        rec_ratio = n
-                        break
-            if rec_name and rec_date and rec_ratio is not None:
-                records.append({
-                    "name": rec_name[:80],
-                    "date": rec_date,
-                    "ratio": float(rec_ratio),
-                    "change": rec_change if rec_change is not None else None,
-                    "table_idx": t_idx,
-                })
+            rec_ratio = _coerce_number(row.get(ratio_col))
+            if rec_ratio is None or not (0 <= rec_ratio < 50):
+                continue
+            rec_change = _coerce_number(row.get(change_col)) if change_col is not None else None
+            if rec_change is not None and abs(rec_change) >= 50:
+                rec_change = None
+            records.append({
+                "name": rec_name[:80],
+                "date": rec_date,
+                "ratio": float(rec_ratio),
+                "change": rec_change,
+                "table_idx": t_idx,
+            })
     return records
 
 
-def analyse_karauri(code: str) -> dict:
+def _cover_streak(recs: list[dict]) -> tuple[int, float]:
+    """最新報告から遡って何回連続で残高割合を減らした(=買い戻した)かを数える。
+
+    recs は日付降順。増減列があればそれを使い、無ければ前後の残高割合差で判定。
+    増減 0 (変わらず) や増加・新規IN でストリークは途切れる。
+    """
+    streak = 0
+    total_delta = 0.0
+    for i, rec in enumerate(recs):
+        delta = rec.get("change")
+        if delta is None and i + 1 < len(recs):
+            older = recs[i + 1]
+            if rec.get("ratio") is not None and older.get("ratio") is not None:
+                delta = rec["ratio"] - older["ratio"]
+        if delta is not None and delta < 0:
+            streak += 1
+            total_delta += float(delta)
+        else:
+            break
+    return streak, total_delta
+
+
+def analyse_karauri(code: str, within_days: int = 7,
+                    min_consecutive: int = 2) -> dict:
+    """機関投資家ごとに最新報告から min_consecutive 回以上連続で買い戻しており、
+    かつ最新の買戻し報告が within_days 日以内の場合のみシグナルとしてカウントする。"""
     code = str(code).zfill(4)
     html = _fetch_karauri_html(code)
     records = _parse_karauri_records(html)
@@ -427,46 +430,41 @@ def analyse_karauri(code: str) -> dict:
         by_inst.setdefault(key, []).append(rec)
         if key not in display_name or len(rec["name"]) > len(display_name[key]):
             display_name[key] = rec["name"]
+    today = pd.Timestamp.now().normalize()
     covering = []
     for key, recs in by_inst.items():
         recs = sorted(recs, key=lambda x: x["date"], reverse=True)
         latest = recs[0]
-        prev = recs[1] if len(recs) > 1 else None
-        is_covering = False
-        delta = 0.0
-        if prev is not None and latest["ratio"] < prev["ratio"]:
-            is_covering = True
-            delta = latest["ratio"] - prev["ratio"]
-        elif latest.get("change") is not None and latest["change"] < 0:
-            is_covering = True
-            delta = float(latest["change"])
-        if is_covering:
+        if within_days and (today - latest["date"].normalize()).days > within_days:
+            continue
+        streak, total_delta = _cover_streak(recs)
+        if streak >= min_consecutive:
             covering.append({
                 "name": display_name[key],
                 "latest_date": latest["date"].strftime("%Y-%m-%d"),
                 "latest_ratio": latest["ratio"],
-                "prev_ratio": prev["ratio"] if prev else None,
-                "delta": delta,
+                "streak": streak,
+                "total_delta": round(total_delta, 3),
             })
-    covering.sort(key=lambda x: x["delta"])
+    covering.sort(key=lambda x: (-x["streak"], x["total_delta"]))
     count = len(covering)
     if count == 0:
         return {"found": False, "info": "", "count": 0,
                 "records_total": len(records),
                 "institutions": list(display_name.values()), "covering": []}
-    names = ", ".join(c["name"][:30] for c in covering[:3])
-    info = f"{count} institutions covering ({names})"
+    names = ", ".join(f"{c['name'][:25]}×{c['streak']}連続" for c in covering[:3])
+    info = f"{count}機関が{min_consecutive}回以上連続買戻し ({names})"
     return {"found": True, "info": info, "count": count,
             "records_total": len(records),
             "institutions": list(display_name.values()), "covering": covering}
 
 
-def has_recent_short_cover(code: str, within_days: int = 60, sc_df=None) -> tuple[bool, str]:
+def has_recent_short_cover(code: str, within_days: int = 7, sc_df=None) -> tuple[bool, str]:
     code = str(code).zfill(4)
     cached = _cache_get(f"karauri:{code}")
     if cached is not None:
         return cached.get("found", False), cached.get("info", "")
-    res = analyse_karauri(code)
+    res = analyse_karauri(code, within_days=within_days)
     _cache_set(f"karauri:{code}", res)
     return res.get("found", False), res.get("info", "")
 
@@ -566,7 +564,7 @@ def metrics_from_history(df: pd.DataFrame, code: str, name: str = "",
 def evaluate_stock(code: str | int, name: str = "", sector: str = "",
                    theme: str = "", market: str = "", period: str = "2y",
                    paid_so_window_days: int = 365,
-                   short_cover_window_days: int = 60,
+                   short_cover_window_days: int = 7,
                    check_turnaround: bool = False,
                    fetch_signals: bool = True,
                    paid_so_df=None, short_cover_df=None) -> StockMetrics:
@@ -583,7 +581,8 @@ def evaluate_stock(code: str | int, name: str = "", sector: str = "",
         m.shares_outstanding = float(shares)
     if fetch_signals:
         try:
-            sr, si = has_recent_short_cover(str(code).zfill(4))
+            sr, si = has_recent_short_cover(str(code).zfill(4),
+                                            within_days=short_cover_window_days)
             m.short_cover_recent = sr
             m.short_cover_info = si
             m.short_cover_count = short_cover_count(str(code).zfill(4))
@@ -706,6 +705,7 @@ class ScreenConfig:
     market_cap_max_oku: float = 500
     avg_volume_min: int = 10_000
     avg_volume_max: int = 500_000
+    price_min: float = 300.0
     volume_surge_min: float = 1.0
     volume_surge_enabled: bool = False
     themes: tuple[str, ...] = ()
@@ -714,7 +714,7 @@ class ScreenConfig:
     paid_so_window_days: int = 365
     require_turnaround: bool = False
     require_short_cover: bool = False
-    short_cover_window_days: int = 60
+    short_cover_window_days: int = 7
     fetch_signals: bool = True
 
 
@@ -723,6 +723,8 @@ WAR_GAFA_SENSITIVE_THEMES = {"半導体関連"}
 
 def _passes_history_filters(m: StockMetrics, c: ScreenConfig) -> bool:
     if math.isnan(m.last_close):
+        return False
+    if m.last_close < c.price_min:
         return False
     if not (c.avg_volume_min <= m.avg_volume_60 <= c.avg_volume_max):
         return False
@@ -831,7 +833,8 @@ def screen_universe_parallel(
             return None
         if needs_signals:
             try:
-                sr, si = has_recent_short_cover(m.code)
+                sr, si = has_recent_short_cover(
+                    m.code, within_days=config.short_cover_window_days)
                 m.short_cover_recent = sr
                 m.short_cover_info = si
                 m.short_cover_count = short_cover_count(m.code)

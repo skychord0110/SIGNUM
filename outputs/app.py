@@ -247,10 +247,10 @@ def cached_info(code: str) -> dict:
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def cached_evaluate(code: str, name: str, sector: str, theme: str, market: str,
-                    fetch_signals: bool = True, cache_version: str = "v18"):
+                    fetch_signals: bool = True, cache_version: str = "v19"):
     m = az.evaluate_stock(
         code=code, name=name, sector=sector, theme=theme, market=market,
-        paid_so_window_days=365, short_cover_window_days=60,
+        paid_so_window_days=365, short_cover_window_days=7,
         check_turnaround=True, fetch_signals=fetch_signals,
     )
     return m.__dict__
@@ -545,7 +545,7 @@ def render_screened_charts(df_results: pd.DataFrame, period: str = "1y",
             sc_recent = r.get("short_cover_recent", False)
             sc_count = r.get("short_cover_count", 0)
             cover_badge = (
-                f"<span class='chart-card-cover'> · 📉 {sc_count} inst covering</span>"
+                f"<span class='chart-card-cover'> · 📉 {sc_count}機関 連続買戻し</span>"
                 if sc_recent and sc_count > 0 else ""
             )
             with col:
@@ -583,6 +583,12 @@ def render_filter_ui(universe: pd.DataFrame, key_prefix: str = "scr",
             min_value=10, max_value=2000, value=(30, 500), step=10,
             key=f"{key_prefix}_mc",
         )
+        price_min = st.number_input(
+            "Min Stock Price (¥) — 株価下限",
+            min_value=0, value=300, step=50,
+            key=f"{key_prefix}_pricemin",
+        )
+        st.caption("この株価以上の銘柄のみ抽出 (デフォルト: ¥300)")
     with c2:
         st.markdown("**60D Avg Volume (shares)**")
         v_col1, v_col2 = st.columns(2)
@@ -608,13 +614,15 @@ def render_filter_ui(universe: pd.DataFrame, key_prefix: str = "scr",
         require_short_cover = False
         if show_short_cover_filter:
             require_short_cover = st.checkbox(
-                "🆕 Short Cover Signal Only", value=False, key=f"{key_prefix}_scfilter")
+                "🆕 連続買戻しシグナルのみ (機関が2回以上連続で買戻し)",
+                value=False, key=f"{key_prefix}_scfilter")
         limit = st.slider("Universe size to evaluate", 20, len(universe),
                           len(universe), 10, key=f"{key_prefix}_limit")
     return {
         "dd_low": dd_low, "dd_high": dd_high,
         "mc_low": mc_low, "mc_high": mc_high,
         "vol_min": int(vol_min), "vol_max": int(vol_max),
+        "price_min": float(price_min),
         "volume_surge_enabled": bool(volume_surge_enabled),
         "vs_min": float(vs_min),
         "themes": tuple(themes),
@@ -633,6 +641,7 @@ def build_screen_config(f: dict, fetch_signals: bool = True,
         market_cap_max_oku=f["mc_high"],
         avg_volume_min=f["vol_min"],
         avg_volume_max=f["vol_max"],
+        price_min=f["price_min"],
         volume_surge_min=f["vs_min"] if f["volume_surge_enabled"] else 0.0,
         volume_surge_enabled=f["volume_surge_enabled"],
         themes=f["themes"],
@@ -1042,7 +1051,7 @@ def tab_detail(universe: pd.DataFrame, period: str, default_code: str = "",
     if m.short_cover_recent:
         debug_col1.success(f"📉➡️📈 連続買戻し検出 — {m.short_cover_info}")
     else:
-        debug_col1.info("No short cover signal detected from karauri.net.")
+        debug_col1.info("連続買戻しシグナルなし — 最新の買戻しが過去1週間以内で、かつ2回以上連続して買い戻している機関は検出されませんでした (karauri.net)。")
     if debug_col2.button("🔄 Re-fetch", key=f"refresh_{code}"):
         az.clear_scrape_cache()
         st.cache_data.clear()
